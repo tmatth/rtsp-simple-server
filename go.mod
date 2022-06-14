@@ -53,3 +53,5 @@ require (
 replace github.com/notedit/rtmp => github.com/aler9/rtmp v0.0.0-20210403095203-3be4a5535927
 
 replace github.com/orcaman/writerseeker => github.com/aler9/writerseeker v0.0.0-20220601075008-6f0e685b9c82
+
+replace github.com/aler9/gortsplib => github.com/tmatth/gortsplib v0.0.0-20220614154451-db8d10015278
