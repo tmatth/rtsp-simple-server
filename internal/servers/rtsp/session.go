@@ -4,15 +4,21 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
 	rtspauth "github.com/bluenviron/gortsplib/v4/pkg/auth"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
+	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/google/uuid"
 	"github.com/pion/rtp"
+	"github.com/pion/rtcp"
 
 	"github.com/bluenviron/mediamtx/internal/auth"
 	"github.com/bluenviron/mediamtx/internal/conf"
@@ -45,6 +51,110 @@ type session struct {
 	query           string
 	decodeErrLogger logger.Writer
 	writeErrLogger  logger.Writer
+}
+
+type RTCPFeedbackMap struct {
+    mu sync.Mutex
+    // These are pairs of publisher {SSRCs: UDP socket} for sending PLIs upstream
+    publisherRTCPFeedbackSockets map[uint32]*net.UDPAddr
+}
+
+var udpConn *net.UDPConn = nil
+var remoteRTCPAddr *net.UDPAddr = nil
+var feedbackMap *RTCPFeedbackMap = nil
+
+func (f *RTCPFeedbackMap) addBinding(ssrc uint32, address *net.UDPAddr) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publisherRTCPFeedbackSockets[ssrc] = address
+	log.Printf("Added %v as %s to %v", address, ssrc, f.publisherRTCPFeedbackSockets)
+}
+
+func (f *RTCPFeedbackMap) deleteBinding(ssrc uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.publisherRTCPFeedbackSockets, ssrc)
+	log.Printf("Deleted %v from %v", ssrc, f.publisherRTCPFeedbackSockets)
+}
+
+func (f *RTCPFeedbackMap) forwardPLI(ssrc uint32, pkt rtcp.Packet) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if remoteRTCPAddr, exists := f.publisherRTCPFeedbackSockets[ssrc]; exists {
+		rtcpBytes, _ := pkt.Marshal()
+		log.Printf("Sending %v to %v for SSRC %v", rtcpBytes, remoteRTCPAddr, ssrc)
+		udpConn.WriteToUDP(rtcpBytes, remoteRTCPAddr)
+	} else {
+		log.Printf("Dropping PLI with MediaSSRC %v not found in %v", ssrc, f.publisherRTCPFeedbackSockets)
+	}
+}
+
+func init() {
+
+	feedbackMap = new(RTCPFeedbackMap)
+	feedbackMap.publisherRTCPFeedbackSockets = make(map[uint32]*net.UDPAddr)
+
+	const DEFAULT_LATCH_PORT = uint64(54321)
+
+	publisherLatchPort := DEFAULT_LATCH_PORT
+	var err error = nil
+	if publisherLatchPortStr, ok := os.LookupEnv("PUBLISHER_LATCH_PORT"); ok {
+		publisherLatchPort, err = strconv.ParseUint(publisherLatchPortStr, 10, 32)
+		if err != nil {
+			log.Printf("Error parsing %v", publisherLatchPortStr)
+			return
+		}
+	}
+
+	addr := net.UDPAddr{
+		Port: int(publisherLatchPort),
+		IP: net.ParseIP("0.0.0.0"),
+	}
+
+	if udpConn == nil {
+		var err error
+		udpConn, err = net.ListenUDP("udp", &addr)
+		if err != nil {
+			log.Printf("Error on listening %v", err)
+		} else {
+			log.Printf("Listening to %v to discover where to send RTCP", addr)
+		}
+	}
+
+	// This goroutine will get a dummy packet whose source is where we will send RTCP feedback
+	go func() {
+		buffer := make([]byte, 64)
+		if udpConn == nil {
+			return
+		}
+		bytesReceived, remoteRTCPAddr, socketErr := 0, new(net.UDPAddr), error(nil)
+		for socketErr == nil {
+			bytesReceived, remoteRTCPAddr, socketErr = udpConn.ReadFromUDP(buffer)
+			if socketErr != nil {
+				return
+			}
+			tokens := strings.Split(string(buffer[:bytesReceived]), " ")
+			if len(tokens) < 2 {
+				log.Printf("Error parsing %v", buffer[:bytesReceived])
+				return
+			}
+			method := tokens[0]
+			publisherId, err := strconv.ParseUint(tokens[1], 10, 32)
+			if err != nil {
+				log.Printf("Error parsing %v", buffer[:bytesReceived])
+				return
+			}
+			log.Printf("Read a message from %v (%d bytes): %v %v", remoteRTCPAddr, bytesReceived, method, publisherId)
+			switch {
+			case method == "POST":
+				feedbackMap.addBinding(uint32(publisherId), remoteRTCPAddr)
+			case method == "DELETE":
+				feedbackMap.deleteBinding(uint32(publisherId))
+			default:
+				log.Printf("Unexpected method %v", method)
+			}
+		}
+	}()
 }
 
 func (s *session) initialize() {
@@ -258,6 +368,20 @@ func (s *session) onPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, e
 			Reader:          s.APIReaderDescribe(),
 			Query:           s.rsession.SetuppedQuery(),
 		})
+
+		for _, medi := range s.rsession.SetuppedMedias() {
+			for _, _ = range medi.Formats {
+				s.rsession.OnPacketRTCPAny(func(medi *description.Media, pkt rtcp.Packet) {
+					switch p := pkt.(type) {
+					case *rtcp.PictureLossIndication:
+						s.Log(logger.Warn, "Got PLI packet %v, %d bytes\n", p, pkt.MarshalSize())
+						feedbackMap.forwardPLI(p.MediaSSRC, pkt)
+					default:
+						s.Log(logger.Debug, "Got RTCP packet %v, %d bytes\n", p, pkt.MarshalSize())
+					}
+				})
+			}
+		}
 
 		s.mutex.Lock()
 		s.state = gortsplib.ServerSessionStatePlay
